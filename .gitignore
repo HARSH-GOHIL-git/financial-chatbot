@@ -1,0 +1,29 @@
+# Environments & Secrets
+.env
+*.env
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Databases & local state
+chroma_db/
+
+# OS/System files
+.DS_Store
+Thumbs.db
+
+# Folders
+test_files/
+md_files/
+
+# Files
+Brief_desc.txt
+Chatbot Architecture.txt
+llm.yml
+task progress.odt
+translate_excel_german_to_english.py
+image_cache.db

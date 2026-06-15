@@ -430,17 +430,22 @@ def search_knowledge_base(
                     image_hash = meta.get("image_hash")
                     
                     description = None
-                    # Call VLM directly as requested
-                    if image_path and os.path.exists(image_path):
-                        vlm_prompt = f"Explain this image from page {page} of '{matched_filename}' in detail."
-                        if query and query.strip():
-                            vlm_prompt = f"Explain this image in 300-400 words from page {page} of '{matched_filename}' in the context of the question: '{query}'"
-                        
-                        description = call_gemini_flash_vlm(image_path, vlm_prompt)
-                        if image_hash and description:
-                            save_to_cache(image_hash, description)
-                    else:
-                        description = f"[Image file not found at {image_path}]"
+                    # First check the cache if image_hash is available
+                    if image_hash:
+                        description = get_cached_description(image_hash)
+                    
+                    if not description:
+                        # Call VLM directly as requested if not cached
+                        if image_path and os.path.exists(image_path):
+                            vlm_prompt = f"Explain this image from page {page} of '{matched_filename}' in detail."
+                            if query and query.strip():
+                                vlm_prompt = f"Explain this image in 300-400 words from page {page} of '{matched_filename}' in the context of the question: '{query}'"
+                            
+                            description = call_gemini_flash_vlm(image_path, vlm_prompt)
+                            if image_hash and description and not description.startswith("[Error"):
+                                save_to_cache(image_hash, description)
+                        else:
+                            description = f"[Image file not found at {image_path}]"
                     image_descriptions.append(description)
                     
             output_parts = [f"=== Content of Page {page} of {matched_filename} ==="]

@@ -180,6 +180,8 @@ RULES:
 6. Use python_interpreter for Excel, CSV, or math/data analysis tasks. ALWAYS print the results (e.g., using print()) so they show up in the tool output.
 7. For standard web search queries, information lookup, weather, and stock updates, prefer the fast `web_search` tool. Only use Playwright MCP tools (e.g., `playwright_playwright_navigate`, `playwright_playwright_click`) when you explicitly need to interact with dynamic web pages, take screenshots, or fill out web forms.
 8. If the user asks about a document, spreadsheet, or presentation that is not found in the knowledge base, do not attempt to find, read, or parse it directly from the filesystem using raw file tools (like view_file, read_file, or list_directory). Instead, politely inform the user that the document is not currently indexed and request them to upload it via the Knowledge Base sidebar panel.
+9. CRITICAL: The python_interpreter runs each code block in a completely fresh Python process with no memory of previous calls. You MUST always include all necessary imports and variable definitions (e.g. pd.read_csv()) at the top of EVERY code block, even if you loaded the same data one step ago. Never assume any variable exists from a previous python_interpreter call.
+10. When working with any CSV or Excel file for the first time in a code block, ALWAYS print df.columns.tolist() and df.head(2) before attempting any filtering or grouping. Never assume column names — always inspect them first in the same code block before using them.
 """
 
     def chat_node(state: ChatState):

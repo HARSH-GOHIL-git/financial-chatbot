@@ -46,6 +46,7 @@ async function stopGeneration() {
 
 // DOM Elements
 const sidebar = document.getElementById('sidebar');
+const sidebarBackdrop = document.getElementById('sidebar-backdrop');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const sidebarCloseBtn = document.getElementById('sidebar-close-btn');
 const newChatBtn = document.getElementById('new-chat-btn');
@@ -100,7 +101,7 @@ function generateUUID() {
 // Helper: Auto-resize chat textarea input height
 function autoResizeInput() {
     chatInput.style.height = 'auto';
-    chatInput.style.height = (chatInput.scrollHeight - 16) + 'px';
+    chatInput.style.height = chatInput.scrollHeight + 'px';
 }
 
 // Helper: Scroll messages container to bottom
@@ -271,6 +272,12 @@ async function switchThread(threadId) {
     activeThreadId = threadId;
     localStorage.setItem('active_thread_id', threadId);
     renderThreadsSidebar();
+    
+    // Collapse sidebar on mobile screens
+    if (window.innerWidth <= 768) {
+        sidebar.classList.remove('open');
+        if (sidebarBackdrop) sidebarBackdrop.classList.remove('active');
+    }
     
     // Find active metadata
     const activeSession = threadsList.find(t => t.thread_id === threadId);
@@ -967,11 +974,20 @@ function setupEventListeners() {
     // Sidebar responsive toggle
     sidebarToggleBtn.addEventListener('click', () => {
         sidebar.classList.add('open');
+        if (sidebarBackdrop) sidebarBackdrop.classList.add('active');
     });
     
     sidebarCloseBtn.addEventListener('click', () => {
         sidebar.classList.remove('open');
+        if (sidebarBackdrop) sidebarBackdrop.classList.remove('active');
     });
+    
+    if (sidebarBackdrop) {
+        sidebarBackdrop.addEventListener('click', () => {
+            sidebar.classList.remove('open');
+            sidebarBackdrop.classList.remove('active');
+        });
+    }
     
     // Create new chat
     newChatBtn.addEventListener('click', () => {
@@ -979,6 +995,7 @@ function setupEventListeners() {
         // Collapse sidebar on mobile screens
         if (window.innerWidth <= 768) {
             sidebar.classList.remove('open');
+            if (sidebarBackdrop) sidebarBackdrop.classList.remove('active');
         }
     });
     

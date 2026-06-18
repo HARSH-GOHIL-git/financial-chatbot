@@ -1,10 +1,8 @@
 import os
 from dotenv import load_dotenv
 
-# Try loading from the hardcoded path first, then fall back to the relative path of the workspace
-env_path = "/home/neuramonks/Desktop/Harsh/LLM/LangGraph/langgraph-practice/chatbot-12/.env"
-if not os.path.exists(env_path):
-    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
+# Load .env from the project root (two levels above this file: app/core/ -> app/ -> root)
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
 
 load_dotenv(env_path)
 

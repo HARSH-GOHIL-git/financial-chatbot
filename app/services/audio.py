@@ -1,10 +1,13 @@
 _whisper_model = None
 
+from app.core.logger import get_logger
+logger = get_logger(__name__)
+
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        print("[App] Loading local Whisper model ('medium')...")
+        logger.info("[Models] Loading Whisper 'medium' (CPU int8)...")
         _whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
     return _whisper_model
 

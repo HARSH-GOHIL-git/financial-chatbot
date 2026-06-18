@@ -11,19 +11,31 @@ __pycache__/
 
 # Databases & local state
 chroma_db/
+image_cache.db
 
 # OS/System files
 .DS_Store
 Thumbs.db
 
-# Folders
+# Logs
+logs/
+*.log
+
+# Folders to Exclude (RAG generated or test files)
 test_files/
 md_files/
+debug_chunks/
+static/extracted_images/
 
-# Files
+# Excel/CSV uploads
+*.csv
+*.xlsx
+
+# Miscellaneous / Debug files
 Brief_desc.txt
 Chatbot Architecture.txt
 llm.yml
 task progress.odt
 translate_excel_german_to_english.py
-image_cache.db
+inspect_chunks.py
+sync.py

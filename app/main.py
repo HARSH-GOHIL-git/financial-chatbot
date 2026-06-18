@@ -18,6 +18,9 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # Modular imports
 from app.core.config import DB_URI, MCP_SERVERS, MCP_FS_ROOT
+from app.core.logger import setup_logging, get_logger
+
+logger = get_logger(__name__)
 from app.core.security import sanitize_value
 from app.agent.tools import (
     web_search, calculator, stock_price, write_file, read_file, 
@@ -25,7 +28,7 @@ from app.agent.tools import (
     playwright_playwright_navigate
 )
 from app.services.rag_pipeline import (
-    search_knowledge_base, index_pdf_file, index_docx_file, get_embeddings, 
+    search_knowledge_base, index_pdf_file, index_docx_file, get_embeddings,
     get_vectorstore, get_cross_encoder, invalidate_bm25_cache, sanitize_filename
 )
 from app.services.audio import get_whisper_model, transcribe_audio_file
@@ -81,35 +84,28 @@ def get_main_loop():
 async def lifespan(_app: FastAPI):
     global chatbot, _checkpointer, _mcp_client, _loaded_tool_names, _main_loop
     _main_loop = asyncio.get_running_loop()
+    setup_logging()
 
     # Preload models to prevent delays on first queries
     try:
         get_cross_encoder()
     except Exception as e:
-        print(f"[App] Warning: Failed to pre-load CrossEncoder: {e}")
+        logger.warning(f"Failed to pre-load CrossEncoder: {e}")
 
     try:
         get_whisper_model()
     except Exception as e:
-        print(f"[App] Warning: Failed to pre-load Whisper model: {e}")
-
-    try:
-        from app.services.rag_pipeline import load_smolvlm
-        _app.state.smolvlm = load_smolvlm()
-        print("[App] Pre-loaded SmolVLM model successfully.")
-    except Exception as e:
-        print(f"[App] Warning: Failed to pre-load SmolVLM model: {e}")
-        _app.state.smolvlm = None
+        logger.warning(f"Failed to pre-load Whisper model: {e}")
 
     try:
         get_embeddings()
     except Exception as e:
-        print(f"[App] Warning: Failed to pre-load HuggingFaceEmbeddings: {e}")
+        logger.warning(f"Failed to pre-load HuggingFaceEmbeddings: {e}")
 
     try:
         get_vectorstore()
     except Exception as e:
-        print(f"[App] Warning: Failed to pre-load Chroma vectorstore: {e}")
+        logger.warning(f"Failed to pre-load Chroma vectorstore: {e}")
 
     builtin_tools = [
         web_search, calculator, stock_price,
@@ -140,7 +136,7 @@ async def lifespan(_app: FastAPI):
                     "filesystem_move_file"
                 }
                 tools = [t for t in tools if t.name not in dangerous_tools]
-                print(f"[MCP] Filesystem server security: removed write/modify tools. Remaining: {[t.name for t in tools]}")
+                logger.info(f"[MCP] Filesystem: removed write/modify tools. Remaining: {[t.name for t in tools]}")
 
             for t in tools:
                 t._run = make_sync_run(t, get_main_loop)
@@ -150,27 +146,25 @@ async def lifespan(_app: FastAPI):
                 try:
                     navigate_tool = next((t for t in tools if "navigate" in t.name), None)
                     if navigate_tool:
-                        print("[MCP] Playwright: Sleeping 2 seconds to allow server setup...")
+                        logger.info("[MCP] Playwright: sleeping 2s for server setup...")
                         await asyncio.sleep(2.0)
-                        print("[MCP] Playwright: Verifying browser functionality...")
+                        logger.info("[MCP] Playwright: verifying browser...")
                         await asyncio.wait_for(navigate_tool.ainvoke({"url": "about:blank", "headless": True}), timeout=25.0)
-                        print("[MCP] Playwright check: SUCCESS.")
+                        logger.info("[MCP] Playwright: browser check OK.")
                     else:
-                        print("[MCP] Playwright check: No navigate tool found.")
+                        logger.warning("[MCP] Playwright: no navigate tool found.")
                 except Exception as p_err:
-                    print(f"[MCP] Playwright check: FAILED due to {p_err}. Playwright tools will be skipped.")
-                    traceback.print_exc()
+                    logger.error(f"[MCP] Playwright check FAILED: {p_err} — skipping.", exc_info=True)
                     await session_ctx.__aexit__(None, None, None)
                     _mcp_session_contexts.remove(session_ctx)
                     continue
 
             mcp_tools.extend(tools)
-            print(f"[MCP] ✓ '{name}' — {len(tools)} tool(s): {[t.name for t in tools]}")
+            logger.info(f"[MCP] ✓ '{name}' — {len(tools)} tool(s): {[t.name for t in tools]}")
             if _mcp_client is None:
                 _mcp_client = client
         except Exception:
-            print(f"[MCP] ✗ '{name}' failed — skipping.")
-            print(traceback.format_exc())
+            logger.error(f"[MCP] ✗ '{name}' failed — skipping.", exc_info=True)
 
     # Combine and ensure all tool names are unique
     all_tools = []
@@ -181,9 +175,9 @@ async def lifespan(_app: FastAPI):
             all_tools.append(t)
             
     _loaded_tool_names = [t.name for t in all_tools]
-    print(f"\n[App] Tools available: {_loaded_tool_names}\n")
+    logger.info(f"[App] Tools available ({len(_loaded_tool_names)}): {_loaded_tool_names}")
 
-    print(f"[App] Connecting to DB: {DB_URI}")
+    logger.info(f"[App] Connecting to DB...")
     checkpointer_cm = PostgresSaver.from_conn_string(DB_URI)
     _checkpointer = checkpointer_cm.__enter__()
     _checkpointer.setup()
@@ -216,27 +210,26 @@ async def lifespan(_app: FastAPI):
                     );
                 """)
                 conn.commit()
-        print("[App] DB metadata and files tables initialized.")
+        logger.info("[App] DB tables initialised successfully.")
     except Exception as e:
-        print(f"[App] Error initializing DB tables: {e}")
+        logger.error(f"[App] Error initialising DB tables: {e}", exc_info=True)
 
     chatbot = create_chatbot(all_tools, _checkpointer)
-    print("[App] Ready.\n")
+    logger.info("[App] Ready.")
 
     yield
 
-    # Exit session contexts
     for session_ctx in _mcp_session_contexts:
         try:
             await session_ctx.__aexit__(None, None, None)
         except BaseException as e:
-            print(f"[App] Finished closing MCP session: {type(e).__name__}")
+            logger.info(f"[App] MCP session closed: {type(e).__name__}")
 
     try:
         checkpointer_cm.__exit__(None, None, None)
     except BaseException:
         pass
-    print("[App] Shutdown complete.")
+    logger.info("[App] Shutdown complete.")
 
 
 app = FastAPI(title="LangGraph Chatbot", lifespan=lifespan)
@@ -263,7 +256,7 @@ async def get_supported_languages_cached():
             return _supported_languages
             
         try:
-            print("[App] Fetching supported languages dynamically from Gemini...")
+            logger.info("[App] Fetching supported languages from Gemini...")
             from langchain_google_genai import ChatGoogleGenerativeAI
             temp_model = ChatGoogleGenerativeAI(
                 model="gemini-3.1-flash-lite",
@@ -294,9 +287,9 @@ async def get_supported_languages_cached():
             content_clean = content_clean.strip()
             
             _supported_languages = json.loads(content_clean)
-            print(f"[App] Successfully loaded {len(_supported_languages)} supported languages dynamically.")
+            logger.info(f"[App] Loaded {len(_supported_languages)} supported languages dynamically.")
         except Exception as lang_err:
-            print(f"[App] Warning: Failed to fetch supported languages dynamically: {lang_err}. Using fallback languages.")
+            logger.warning(f"[App] Failed to fetch supported languages dynamically: {lang_err} — using fallback list.")
             _supported_languages = [
                 {"code": "en", "name": "English"},
                 {"code": "es", "name": "Spanish"},
@@ -377,9 +370,9 @@ def generate_and_save_title(thread_id: str, message_text: str):
                     (thread_id, title)
                 )
                 conn.commit()
-        print(f"[App] Auto-generated title for thread {thread_id}: '{title}'")
+        logger.info(f"[App] Auto-generated title for thread {thread_id}: '{title}'")
     except Exception as e:
-        print(f"[App] Error auto-generating thread title: {e}")
+        logger.error(f"[App] Error auto-generating thread title: {e}", exc_info=True)
 
 
 @app.get("/health")
@@ -420,8 +413,7 @@ async def rename_thread(thread_id: str, request: RenameRequest):
                 conn.commit()
         return {"status": "success", "thread_id": thread_id, "thread_name": request.thread_name}
     except Exception as e:
-        print(f"[App] Error renaming thread: {e}")
-        traceback.print_exc()
+        logger.error(f"[App] Error renaming thread {thread_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -441,8 +433,7 @@ async def delete_thread(thread_id: str):
                 conn.commit()
         return {"status": "success", "thread_id": thread_id}
     except Exception as e:
-        print(f"[App] Error deleting thread: {e}")
-        traceback.print_exc()
+        logger.error(f"[App] Error deleting thread {thread_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -478,23 +469,19 @@ async def get_thread_documents(thread_id: str):
                             fn = os.path.basename(src)
                             counts[fn] = counts.get(fn, 0) + 1
         except Exception as err:
-            print(f"[App] Error getting chunk counts from Chroma: {err}")
+            logger.warning(f"[App] Error getting chunk counts from Chroma: {err}")
 
-        # If seen_filenames is empty but we found counts in Chroma, add them
         if not seen_filenames:
             for fn in counts:
                 seen_filenames.add(fn)
 
         documents_info = []
         for fname in sorted(list(seen_filenames)):
-            documents_info.append({
-                "filename": fname,
-                "chunks": counts.get(fname, 0)
-            })
+            documents_info.append({"filename": fname, "chunks": counts.get(fname, 0)})
 
         return {"documents": documents_info}
     except Exception as e:
-        print(f"[App] Error listing thread documents: {e}")
+        logger.error(f"[App] Error listing thread documents: {e}", exc_info=True)
         return {"documents": []}
 
 
@@ -531,7 +518,7 @@ async def list_threads():
                     for tid_db, name_db in rows:
                         thread_names[tid_db] = name_db
         except Exception as e:
-            print(f"[App] Error fetching thread names: {e}")
+            logger.error(f"[App] Error fetching thread names: {e}", exc_info=True)
 
     threads_with_metadata = []
     for tid in thread_ids:
@@ -576,7 +563,7 @@ def save_message_timestamps(thread_id: str, messages: list):
                             )
                 conn.commit()
     except Exception as e:
-        print(f"[App] Error saving message timestamps: {e}")
+        logger.error(f"[App] Error saving message timestamps for {thread_id}: {e}", exc_info=True)
 
 
 def get_message_timestamps(thread_id: str) -> dict[str, str]:
@@ -593,7 +580,7 @@ def get_message_timestamps(thread_id: str) -> dict[str, str]:
                 rows = cur.fetchall()
                 return {row[0]: row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]) for row in rows}
     except Exception as e:
-        print(f"[App] Error getting message timestamps: {e}")
+        logger.error(f"[App] Error getting message timestamps for {thread_id}: {e}", exc_info=True)
         return {}
 
 
@@ -743,8 +730,8 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print(f"[App] Concurrency /chat Error:\n{tb}")
-        raise HTTPException(status_code=500, detail=tb)
+        logger.error(f"[App] /chat error for thread {request.thread_id}:\n{tb}")
+        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again.")
 
 
 active_tasks = {}
@@ -756,7 +743,7 @@ async def stop_chat(request: StopRequest):
     if thread_id in active_tasks:
         task = active_tasks[thread_id]
         task.cancel()
-        print(f"[App] Cancelled active task for thread {thread_id}")
+        logger.info(f"[App] Cancelled active stream task for thread {thread_id}.")
         return {"status": "success", "message": f"Cancelled active response for thread {thread_id}"}
     return {"status": "success", "message": f"No active response found for thread {thread_id}"}
 
@@ -775,9 +762,9 @@ async def chat_stream(chat_req: ChatRequest, request: Request, background_tasks:
     if chat_req.thread_id in active_tasks:
         try:
             active_tasks[chat_req.thread_id].cancel()
-            print(f"[App] Cancelled existing task for thread {chat_req.thread_id} before starting new one.")
+            logger.info(f"[App] Cancelled existing task for thread {chat_req.thread_id} before new stream.")
         except Exception as cancel_err:
-            print(f"[App] Error cancelling existing task: {cancel_err}")
+            logger.warning(f"[App] Error cancelling existing task: {cancel_err}")
 
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
@@ -798,12 +785,11 @@ async def chat_stream(chat_req: ChatRequest, request: Request, background_tasks:
                 stream_mode="messages"
             ):
                 if is_thread_cancelled(chat_req.thread_id):
-                    print(f"[App] Producer for thread {chat_req.thread_id} detected cancellation. Aborting stream.")
+                    logger.info(f"[App] Producer for thread {chat_req.thread_id}: cancellation detected, aborting stream.")
                     break
                 loop.call_soon_threadsafe(queue.put_nowait, (msg, metadata))
         except Exception as e:
-            print("[App] Error in stream producer:", e)
-            traceback.print_exc()
+            logger.error(f"[App] Stream producer error for thread {chat_req.thread_id}: {e}", exc_info=True)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, (None, None))
 
@@ -815,13 +801,13 @@ async def chat_stream(chat_req: ChatRequest, request: Request, background_tasks:
         try:
             while True:
                 if await request.is_disconnected():
-                    print(f"[App] Client disconnected for thread {chat_req.thread_id}")
+                    logger.info(f"[App] Client disconnected for thread {chat_req.thread_id}.")
                     cancel_thread(chat_req.thread_id)
                     task.cancel()
                     break
 
                 if is_thread_cancelled(chat_req.thread_id):
-                    print(f"[App] event_generator for thread {chat_req.thread_id} detected cancellation. Breaking.")
+                    logger.info(f"[App] event_generator for thread {chat_req.thread_id} cancelled.")
                     task.cancel()
                     break
 
@@ -898,10 +884,10 @@ async def chat_stream(chat_req: ChatRequest, request: Request, background_tasks:
                                         "timestamp": timestamp_str
                                     }) + "\n"
                 except Exception as state_err:
-                    print("[App] Error saving stream timestamps at end:", state_err)
+                    logger.error(f"[App] Error saving stream timestamps: {state_err}", exc_info=True)
 
         except asyncio.CancelledError:
-            print(f"[App] event_generator CancelledError for thread {chat_req.thread_id}")
+            logger.info(f"[App] event_generator cancelled for thread {chat_req.thread_id}.")
             cancel_thread(chat_req.thread_id)
             task.cancel()
         finally:
@@ -912,22 +898,25 @@ async def chat_stream(chat_req: ChatRequest, request: Request, background_tasks:
 
 
 @app.post("/upload-pdf")
-async def upload_pdf(request: Request, file: UploadFile = File(...), thread_id: str = "default"):
+async def upload_pdf(file: UploadFile = File(...), thread_id: str = "default"):
+    MAX_SIZE = 50 * 1024 * 1024  # 50 MB
     try:
         filename = file.filename
         _, ext = os.path.splitext(filename.lower())
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            shutil.copyfileobj(file.file, tmp)
-            temp_path = tmp.name
 
-        smolvlm = getattr(request.app.state, "smolvlm", None)
+        file_bytes = await file.read()
+        if len(file_bytes) > MAX_SIZE:
+            raise HTTPException(status_code=413, detail="File too large. Maximum allowed size is 50 MB.")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(file_bytes)
+            temp_path = tmp.name
 
         try:
             if ext == ".docx":
-                chunks_added = index_docx_file(temp_path, filename, thread_id, db_uri=DB_URI, smolvlm=smolvlm)
+                chunks_added = index_docx_file(temp_path, filename, thread_id, db_uri=DB_URI)
             else:
-                chunks_added = index_pdf_file(temp_path, filename, thread_id, db_uri=DB_URI, smolvlm=smolvlm)
+                chunks_added = index_pdf_file(temp_path, filename, thread_id, db_uri=DB_URI)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -936,21 +925,28 @@ async def upload_pdf(request: Request, file: UploadFile = File(...), thread_id: 
             "status": "success",
             "message": f"Processed '{filename}' — added {chunks_added} chunks.",
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("[App] PDF upload failed.", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred during file processing.")
 
 
 @app.post("/upload-excel")
 async def upload_excel(file: UploadFile = File(...), thread_id: str = "default"):
+    MAX_SIZE = 50 * 1024 * 1024  # 50 MB
     try:
         filename = file.filename
         if not filename.lower().endswith(('.xlsx', '.xls', '.csv')):
             raise HTTPException(status_code=400, detail="Only Excel (.xlsx, .xls) and CSV (.csv) files are supported.")
-        
-        target_path = os.path.join(os.getcwd(), filename)
+
+        file_bytes = await file.read()
+        if len(file_bytes) > MAX_SIZE:
+            raise HTTPException(status_code=413, detail="File too large. Maximum allowed size is 50 MB.")
+
+        target_path = os.path.join(MCP_FS_ROOT, filename)
         with open(target_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            buffer.write(file_bytes)
 
         if DB_URI:
             db_uri_clean = DB_URI.strip('"').strip("'")
@@ -967,32 +963,43 @@ async def upload_excel(file: UploadFile = File(...), thread_id: str = "default")
             "status": "success",
             "message": f"Saved '{filename}' to workspace for data analysis.",
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("[App] Excel/CSV upload failed.", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred while saving the file.")
 
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
+    MAX_SIZE = 25 * 1024 * 1024  # 25 MB
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            shutil.copyfileobj(file.file, tmp)
+        _, ext = os.path.splitext((file.filename or "").lower())
+        audio_ext = ext if ext in (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".webm") else ".wav"
+
+        file_bytes = await file.read()
+        if len(file_bytes) > MAX_SIZE:
+            raise HTTPException(status_code=413, detail="Audio file too large. Maximum allowed size is 25 MB.")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=audio_ext) as tmp:
+            tmp.write(file_bytes)
             temp_path = tmp.name
 
         try:
             transcription = transcribe_audio_file(temp_path)
         except Exception as trans_err:
-            print(f"[App] Transcription internal error: {trans_err}")
+            logger.warning(f"[App] Transcription internal error: {trans_err}")
             raise trans_err
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
         return {"text": transcription}
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[App] Error in transcription: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[App] Transcription failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred during transcription.")
 
 
 @app.delete("/api/files/{filename}")
@@ -1050,5 +1057,5 @@ async def delete_file(filename: str, thread_id: str):
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(traceback.format_exc())
+        logger.error("[App] File deletion failed.", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

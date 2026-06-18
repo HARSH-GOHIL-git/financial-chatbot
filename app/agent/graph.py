@@ -12,6 +12,9 @@ import queue
 import time
 import re
 from contextvars import ContextVar
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 # ContextVar to track the current active thread ID in the execution context
 current_thread_id = ContextVar("current_thread_id", default=None)
@@ -23,7 +26,7 @@ cancelled_threads_lock = threading.Lock()
 def cancel_thread(thread_id: str):
     with cancelled_threads_lock:
         cancelled_threads.add(thread_id)
-        print(f"[Cancellation] Marked thread {thread_id} as cancelled.")
+        logger.info(f"[Cancellation] Thread {thread_id} marked as cancelled.")
 
 def is_thread_cancelled(thread_id: str) -> bool:
     with cancelled_threads_lock:
@@ -32,7 +35,7 @@ def is_thread_cancelled(thread_id: str) -> bool:
 def clear_thread_cancellation(thread_id: str):
     with cancelled_threads_lock:
         cancelled_threads.discard(thread_id)
-        print(f"[Cancellation] Cleared cancellation flag for thread {thread_id}.")
+        logger.debug(f"[Cancellation] Cleared flag for thread {thread_id}.")
 
 
 class ChatState(TypedDict):
@@ -80,49 +83,43 @@ def invoke_llm_with_fallback(primary_llm, fallback_llm, messages, max_retries=3)
     """Invokes LLM and retries/falls back on 429 (rate limits) or 503 (temporary) errors."""
     current_llm = primary_llm
     tid = current_thread_id.get()
-    
+
     for attempt in range(max_retries):
-        # Check cancellation before invocation
         if tid and is_thread_cancelled(tid):
-            print(f"[LLM] Thread {tid} was cancelled. Aborting LLM call.")
+            logger.info(f"[LLM] Thread {tid} cancelled — aborting before attempt {attempt + 1}.")
             raise RuntimeError(f"Thread {tid} was cancelled.")
-            
         try:
             return current_llm.invoke(messages)
         except Exception as e:
             err_msg = str(e)
-            print(f"[LLM] Error calling LLM (attempt {attempt+1}/{max_retries}): {err_msg}")
-            
+            logger.warning(f"[LLM] Error on attempt {attempt+1}/{max_retries}: {err_msg}")
+
             is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower()
             is_temp_server_err = "503" in err_msg or "UNAVAILABLE" in err_msg or "temporary" in err_msg.lower()
-            
+
             if is_rate_limit or is_temp_server_err:
                 wait_time = 6.0
                 match = re.search(r"retry in ([\d\.]+)s", err_msg)
                 if match:
                     wait_time = float(match.group(1)) + 0.5
-                
-                print(f"[LLM] Rate limit or temporary error hit. Waiting {wait_time}s before retry...")
-                
-                # Sleep in small increments to check cancellation during sleep
+
+                logger.warning(f"[LLM] Rate-limit/server error — waiting {wait_time}s before retry.")
                 slept = 0.0
                 while slept < wait_time:
                     if tid and is_thread_cancelled(tid):
-                        print(f"[LLM] Thread {tid} was cancelled during retry sleep. Aborting.")
+                        logger.info(f"[LLM] Thread {tid} cancelled during retry sleep — aborting.")
                         raise RuntimeError(f"Thread {tid} was cancelled.")
                     time.sleep(0.5)
                     slept += 0.5
-                
-                # Switch to fallback model on second attempt if available
+
                 if fallback_llm and current_llm is primary_llm:
-                    print("[LLM] Switching to fallback model for the next attempt...")
+                    logger.warning("[LLM] Switching to fallback model for next attempt.")
                     current_llm = fallback_llm
             else:
                 raise e
-                
-    # Final check before final invocation
+
     if tid and is_thread_cancelled(tid):
-        print(f"[LLM] Thread {tid} was cancelled. Aborting LLM call.")
+        logger.info(f"[LLM] Thread {tid} cancelled — aborting final attempt.")
         raise RuntimeError(f"Thread {tid} was cancelled.")
     return current_llm.invoke(messages)
 
@@ -187,7 +184,7 @@ RULES:
     def chat_node(state: ChatState):
         tid = current_thread_id.get()
         if tid and is_thread_cancelled(tid):
-            print(f"[chat_node] Thread {tid} was cancelled. Aborting node execution.")
+            logger.info(f"[chat_node] Thread {tid} cancelled — aborting node.")
             raise RuntimeError(f"Thread {tid} was cancelled.")
 
         messages = list(state["messages"])
@@ -217,7 +214,7 @@ New messages to summarize:
                 summary = str(summary_response.content)
                 last_summarized_count = len(messages) - 10
             except Exception as e:
-                print(f"[Summarizer] Error during conversation summarization: {e}")
+                logger.error(f"[Summarizer] Conversation summarisation failed: {e}", exc_info=True)
 
         # Safely trim messages to prevent Gemini API invalid sequence errors
         messages_to_send = safe_trim_messages(messages, 10)
@@ -240,7 +237,7 @@ New messages to summarize:
                             )
                             thread_files = [row[0] for row in cur.fetchall()]
                 except Exception as db_err:
-                    print(f"[chat_node] Error querying database for thread files: {db_err}")
+                    logger.error(f"[chat_node] DB query for thread files failed: {db_err}", exc_info=True)
                     
             if not thread_files:
                 try:
@@ -255,7 +252,7 @@ New messages to summarize:
                                 seen.add(os.path.basename(m["source"]))
                         thread_files = list(seen)
                 except Exception as vs_err:
-                    print(f"[chat_node] Error querying vectorstore for thread files: {vs_err}")
+                    logger.error(f"[chat_node] Vectorstore query for thread files failed: {vs_err}", exc_info=True)
 
         custom_system_prompt = SYSTEM_PROMPT
         if thread_files:

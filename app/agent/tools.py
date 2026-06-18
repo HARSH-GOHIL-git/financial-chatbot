@@ -8,6 +8,9 @@ from langgraph.prebuilt import InjectedState
 from langchain_experimental.utilities import PythonREPL
 from app.core.security import is_path_sensitive, is_code_safe, sanitize_value
 from app.core.config import MCP_FS_ROOT
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 @tool
 def web_search(query: str) -> str:
@@ -297,7 +300,7 @@ def playwright_playwright_navigate(
     if not user_query:
         user_query = f"Explain the page content of {url}"
         
-    print(f"[Playwright RAG] Ephemeral RAG for URL: {url}, thread_id: {thread_id}, query: '{user_query}'")
+    logger.info(f"[Playwright RAG] URL: {url} | thread: {thread_id} | query: '{user_query}'")
     
     # Run playwright in a separate event loop on a dedicated thread to be 100% safe
     def run_playwright_pdf():
@@ -311,7 +314,7 @@ def playwright_playwright_navigate(
                     # wait_until='networkidle' with a timeout=15000 (15 seconds) fallback
                     await page.goto(url, wait_until="networkidle", timeout=15000)
                 except Exception as e:
-                    print(f"[Playwright RAG] Navigation timeout or error: {e}")
+                    logger.warning(f"[Playwright RAG] Navigation timeout or error: {e}")
                 
                 # Capture the PDF of the full page scroll
                 await page.pdf(path=temp_pdf_path, print_background=True)
@@ -339,7 +342,7 @@ def playwright_playwright_navigate(
         db_uri=None
     )
     
-    print(f"[Playwright RAG] Ephemerally indexed {filename} ({chunks_added} chunks added)")
+    logger.info(f"[Playwright RAG] Indexed {filename} ({chunks_added} chunks).")
     
     # Query the data using the internal logic directly bypassing the @tool decorator wrapper
     result_text = ""
@@ -356,7 +359,7 @@ def playwright_playwright_navigate(
             text_only=text_only_val
         )
     except Exception as query_err:
-        print(f"[Playwright RAG] Error querying knowledge base: {query_err}")
+        logger.error(f"[Playwright RAG] Query error: {query_err}", exc_info=True)
         result_text = f"Error performing search: {query_err}"
         
     # Clean up (CRITICAL ORDER)
@@ -380,8 +383,8 @@ def playwright_playwright_navigate(
         images_dir = os.path.join("static", "extracted_images", sanitized_hashed_filename)
         shutil.rmtree(images_dir, ignore_errors=True)
         
-        print(f"[Playwright RAG] Ephemeral cleanup completed successfully for {filename}.")
+        logger.info(f"[Playwright RAG] Ephemeral cleanup done for {filename}.")
     except Exception as cleanup_err:
-        print(f"[Playwright RAG] Error during cleanup: {cleanup_err}")
+        logger.error(f"[Playwright RAG] Cleanup error: {cleanup_err}", exc_info=True)
         
     return result_text

@@ -14,12 +14,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 import psycopg
 
+from app.core.logger import get_logger
+logger = get_logger(__name__)
+
+
 _cross_encoder = None
 _embeddings = None
 _vectorstore = None
 import threading
 _bm25_lock = threading.Lock()
-_smolvlm_lock = threading.Lock()
 _bm25_indices = {}  # Thread-scoped BM25 indices: thread_id -> (bm25, all_docs)
 
 # SQLite Cache DB Path
@@ -40,7 +43,7 @@ def init_cache_db():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[Cache] Error initializing SQLite cache: {e}")
+        logger.error(f"[Cache] Failed to initialise SQLite cache: {e}", exc_info=True)
 
 # Initialize the cache database
 init_cache_db()
@@ -55,7 +58,7 @@ def get_cached_description(image_hash: str) -> str:
             if row:
                 return row[0]
     except Exception as e:
-        print(f"[Cache] Error querying SQLite cache: {e}")
+        logger.warning(f"[Cache] Query failed: {e}")
     return None
 
 def save_to_cache(image_hash: str, description: str):
@@ -69,7 +72,7 @@ def save_to_cache(image_hash: str, description: str):
             """, (image_hash, description))
             conn.commit()
     except Exception as e:
-        print(f"[Cache] Error writing to SQLite cache: {e}")
+        logger.warning(f"[Cache] Write failed: {e}")
 
 def call_gemini_flash_vlm(image_path: str, query: str) -> str:
     """Calls Gemini 2.5 Flash (falling back to gemini-3.1-flash-lite if needed) to analyze an image."""
@@ -99,98 +102,62 @@ def call_gemini_flash_vlm(image_path: str, query: str) -> str:
                 if response.text:
                     return response.text
             except Exception as inner_err:
-                print(f"[VLM] Model {model_name} invocation failed: {inner_err}")
+                logger.warning(f"[VLM] Model {model_name} failed: {inner_err}")
                 continue
         raise Exception("All VLM models failed to generate content.")
     except Exception as e:
-        print(f"[VLM] Error calling Gemini VLM: {e}")
+        logger.error(f"[VLM] Gemini VLM call failed: {e}", exc_info=True)
         return f"[Error analyzing image at {image_path}: {str(e)}]"
 
-def load_smolvlm():
-    """Preloads the SmolVLM-256M model and vision projector from Hugging Face."""
-    from huggingface_hub import hf_hub_download
-    from llama_cpp import Llama
-    
-    repo_id = "ggml-org/SmolVLM-256M-Instruct-GGUF"
-    model_file = "SmolVLM-256M-Instruct-Q8_0.gguf"
-    proj_file = "mmproj-SmolVLM-256M-Instruct-Q8_0.gguf"
-    
-    print(f"[SmolVLM] Downloading/loading {model_file}...")
-    model_path = hf_hub_download(repo_id=repo_id, filename=model_file)
-    proj_path = hf_hub_download(repo_id=repo_id, filename=proj_file)
-    
-    print("[SmolVLM] Initializing Llama model...")
-    model = Llama(
-        model_path=model_path,
-        mmproj=proj_path,
-        n_ctx=2048,
-        n_threads=4,
-        verbose=False
-    )
-    return model
+# ─────────────────────────────────────────────────────────────
+# IMAGE INGESTION: RapidOCR
+# Used during PDF indexing to extract visible text from images.
+# At query time, Gemini Flash VLM is used for deeper analysis.
+# ─────────────────────────────────────────────────────────────
+_rapid_ocr_instance = None
+_rapid_ocr_lock = threading.Lock()
 
-def call_smolvlm(smolvlm, image_path: str) -> str:
-    """Invokes SmolVLM-256M GGUF on the given image path."""
-    import base64
-    if smolvlm is None:
-        raise ValueError("SmolVLM model not loaded")
-        
-    prompt = (
-        "<im_start>image\n<im_end>\n"
-        "Describe this image briefly in 1-2 sentences for search indexing only. "
-        "State what type of visual it is (chart/table/diagram/photo), the main subject or data shown, "
-        "and any visible titles or axis labels. Do not interpret or analyze."
-    )
-    
-    with open(image_path, "rb") as f:
-        img_bytes = f.read()
-    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-    
-    ext = os.path.splitext(image_path)[1].lower().replace(".", "")
-    if ext in ("jpg", "jpeg"):
-        mime = "image/jpeg"
-    elif ext == "png":
-        mime = "image/png"
-    else:
-        mime = "image/jpeg"
-        
-    data_uri = f"data:{mime};base64,{img_b64}"
-    
-    with _smolvlm_lock:
-        response = smolvlm.create_chat_completion(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": data_uri}}
-                    ]
-                }
-            ]
-        )
-    out_text = response["choices"][0]["message"]["content"]
-    return out_text.strip()
+def get_rapid_ocr():
+    global _rapid_ocr_instance
+    with _rapid_ocr_lock:
+        if _rapid_ocr_instance is None:
+            from rapidocr_onnxruntime import RapidOCR
+            _rapid_ocr_instance = RapidOCR()
+        return _rapid_ocr_instance
+
+def process_image_content(image_path: str) -> str:
+    """Extracts text from an image using RapidOCR during document ingestion."""
+    try:
+        engine = get_rapid_ocr()
+        result, elapse = engine(image_path)
+        if result:
+            texts = [line[1] for line in result]
+            return "\n".join(texts).strip()
+    except Exception as e:
+        logger.warning(f"[RapidOCR] Failed on {image_path}: {e}")
+    return ""
+
 
 
 def get_cross_encoder():
     global _cross_encoder
     if _cross_encoder is None:
         from sentence_transformers import CrossEncoder
-        print("[App] Loading CrossEncoder ('BAAI/bge-reranker-base')...")
+        logger.info("[Models] Loading CrossEncoder 'BAAI/bge-reranker-base'...")
         _cross_encoder = CrossEncoder("BAAI/bge-reranker-base")
     return _cross_encoder
 
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        print("[App] Loading HuggingFaceEmbeddings ('BAAI/bge-base-en-v1.5')...")
+        logger.info("[Models] Loading HuggingFaceEmbeddings 'BAAI/bge-base-en-v1.5'...")
         _embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
     return _embeddings
 
 def get_vectorstore():
     global _vectorstore
     if _vectorstore is None:
-        print("[App] Loading Chroma vectorstore from './chroma_db'...")
+        logger.info("[Models] Loading Chroma vectorstore from './chroma_db'...")
         _vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=get_embeddings())
     return _vectorstore
 
@@ -229,7 +196,7 @@ def get_bm25_index(vectorstore, thread_id: str):
             if len(_bm25_indices) >= 50:
                 oldest_key = next(iter(_bm25_indices))
                 del _bm25_indices[oldest_key]
-                print(f"[BM25 Cache] Evicted cache entry for thread '{oldest_key}' (limit reached)")
+                logger.warning(f"[BM25 Cache] Evicted entry for thread '{oldest_key}' (50-entry limit reached).")
                 
             _bm25_indices[thread_id] = (bm25, all_docs)
         return _bm25_indices[thread_id]
@@ -264,7 +231,7 @@ def expand_query(original_query: str) -> list[str]:
                     llm_response = response.text
                     break
             except Exception as inner_err:
-                print(f"[Query Expansion] Model {model_name} invocation failed: {inner_err}")
+                logger.warning(f"[Query Expansion] Model {model_name} failed: {inner_err}")
                 continue
                 
         if not llm_response:
@@ -285,7 +252,7 @@ def expand_query(original_query: str) -> list[str]:
             return [original_query] + [str(v) for v in variants[:3]]
         return [original_query]
     except Exception as e:
-        print(f"[Query Expansion] Error expanding query: {e}")
+        logger.error(f"[Query Expansion] Failed to expand query: {e}", exc_info=True)
         return [original_query]
 
 
@@ -332,7 +299,7 @@ def search_knowledge_base(
                         )
                         thread_files = [row[0] for row in cur.fetchall()]
             except Exception as db_err:
-                print(f"[search_knowledge_base] Error querying database for thread files: {db_err}")
+                logger.error(f"[RAG] DB query for thread files failed: {db_err}", exc_info=True)
                 
         # If DB query failed or empty, fallback to querying Chroma unique filenames
         if not thread_files:
@@ -347,7 +314,7 @@ def search_knowledge_base(
                             seen.add(os.path.basename(m["source"]))
                     thread_files = list(seen)
             except Exception as vs_err:
-                print(f"[search_knowledge_base] Error querying vectorstore for thread files: {vs_err}")
+                logger.error(f"[RAG] Vectorstore query for thread files failed: {vs_err}", exc_info=True)
 
         # If still no documents, we can't proceed
         if not thread_files:
@@ -471,7 +438,7 @@ def search_knowledge_base(
 
         # Expand query: original query + 3 variants
         queries = expand_query(query)
-        print(f"[RAG Pipeline] Expanded queries: {queries}")
+        logger.info(f"[RAG] Expanded queries: {queries}")
 
         # 1. Retrieve from Vector Search for all queries
         vector_docs_lists = []
@@ -601,7 +568,7 @@ def search_knowledge_base(
         
         return "\n\n".join(context_parts)
     except Exception as e:
-        print(traceback.format_exc())
+        logger.error(f"[RAG] search_knowledge_base failed: {e}", exc_info=True)
         return f"Failed to retrieve from knowledge base: {str(e)}"
 
 def _search_knowledge_base_logic(
@@ -618,7 +585,7 @@ def _search_knowledge_base_logic(
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_\.-]', '_', name)
 
-def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = None, smolvlm = None) -> int:
+def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = None) -> int:
     """Chunks PDF and extracts text, tables, and images, storing them in ChromaDB."""
     import fitz
     
@@ -675,16 +642,24 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
                     area = image_width * image_height
                     aspect_ratio = max(image_width, image_height) / max(min(image_width, image_height), 1)
                     if image_width < 150 or image_height < 150 or area < 50000 or image_size < 20 * 1024 or aspect_ratio > 3.0:
-                        print(f"[Ingestion] Skipping decorative image/logo xref {xref} (width={image_width}, height={image_height}, size={image_size} bytes, aspect_ratio={aspect_ratio:.2f})")
+                        print(f"[Ingestion] Skipping decorative image xref {xref} (w={image_width}, h={image_height}, size={image_size}B, ar={aspect_ratio:.2f})")
                         continue
                         
                     image_hash = hashlib.sha256(image_bytes).hexdigest()
                     
-                    # Save image to folder
-                    image_filename = f"img_page_{page_num}_{xref}.{image_ext}"
-                    image_path = os.path.join(images_dir, image_filename)
-                    with open(image_path, "wb") as f_img:
-                        f_img.write(image_bytes)
+                    # Save cropped image section where possible, fallback to raw image
+                    img_rects = page.get_image_rects(xref)
+                    if img_rects:
+                        image_filename = f"img_page_{page_num}_{xref}.png"
+                        image_path = os.path.join(images_dir, image_filename)
+                        img_rect = img_rects[0]
+                        pix = page.get_pixmap(clip=img_rect, dpi=150)
+                        pix.save(image_path)
+                    else:
+                        image_filename = f"img_page_{page_num}_{xref}.{image_ext}"
+                        image_path = os.path.join(images_dir, image_filename)
+                        with open(image_path, "wb") as f_img:
+                            f_img.write(image_bytes)
                     
                     # Step 2 — SQLite cache check:
                     cached_desc = get_cached_description(image_hash)
@@ -706,11 +681,10 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
                     else:
                         # Step 3 — Surrounding context & Case A/B branching:
                         # Bounding box & surrounding context
-                        img_rects = page.get_image_rects(xref)
                         if img_rects:
                             img_rect = img_rects[0]
                             # Extend bounding box vertically by 200 points
-                            extended_rect = fitz.Rect(0, max(0, img_rect.y0 - 200), page.rect.width, min(img_rect.y1 + 200, page.rect.height))
+                            extended_rect = fitz.Rect(max(0, img_rect.x0 - 50), max(0, img_rect.y0 - 150), min(page.rect.width, img_rect.x1 + 50), min(img_rect.y1 + 150, page.rect.height))
                         else:
                             extended_rect = page.rect
                         
@@ -727,24 +701,16 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
                                     surrounding_blocks.append(b[4])
                         
                         surrounding_text = "\n".join(surrounding_blocks).strip()
-                        # Fallback if too short
-                        if len(surrounding_text) < 50:
-                            fallback_blocks = [b[4] for b in blocks if b[6] == 0 and not any(fitz.Rect(b[:4]).intersects(tr) for tr in table_rects)]
-                            surrounding_text = "\n".join(fallback_blocks).strip()
-                        
                         has_surrounding = bool(surrounding_text.strip())
                         
                         smolvlm_success = False
                         smolvlm_output = ""
-                        if smolvlm is not None:
-                            try:
-                                smolvlm_output = call_smolvlm(smolvlm, image_path)
+                        try:
+                            smolvlm_output = process_image_content(image_path)
+                            if smolvlm_output:
                                 smolvlm_success = True
-                            except Exception as e:
-                                print(f"[Ingestion] Warning: SmolVLM execution failed on image {image_path}: {e}")
-                                traceback.print_exc()
-                        else:
-                            print(f"[Ingestion] Warning: SmolVLM model not available. Skipping SmolVLM execution on {image_path}.")
+                        except Exception as e:
+                            logger.warning(f"[Ingestion] Visual processing failed on {image_path}: {e}")
                         
                         if has_surrounding:
                             # CASE A
@@ -759,6 +725,9 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
                             else:
                                 chunk_text = ""
                         
+                        if smolvlm_success and image_hash:
+                            save_to_cache(image_hash, smolvlm_output)
+                            
                         image_chunk = Document(
                             page_content=chunk_text,
                             metadata={
@@ -768,13 +737,13 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
                                 "chunk_type": "image",
                                 "image_path": image_path,
                                 "image_hash": image_hash,
-                                "needs_vlm": True,
-                                "vlm_done": False
+                                "needs_vlm": not smolvlm_success,
+                                "vlm_done": smolvlm_success
                             }
                         )
                         all_chunks.append(image_chunk)
             except Exception as img_err:
-                print(f"[Ingestion] Error extracting image xref {xref} on page {page_num}: {img_err}")
+                logger.error(f"[Ingestion] Error extracting image xref {xref} on page {page_num}: {img_err}", exc_info=True)
                 
         # 2.5 Detect vector drawings and take a page snapshot if necessary
         try:
@@ -784,70 +753,132 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
                 p for p in paths
                 if not any(p["rect"].intersects(tr) for tr in table_rects)
             ]
-            if len(non_table_paths) > 10:
-                # Render the page as a high-quality snapshot
-                pix = page.get_pixmap(dpi=150)
-                page_img_filename = f"page_{page_num}_snapshot.png"
-                page_img_path = os.path.join(images_dir, page_img_filename)
-                pix.save(page_img_path)
+            
+            # Filter out decorative/layout drawings (headers, footers, full page borders)
+            content_paths = []
+            for p in non_table_paths:
+                r = p["rect"]
+                # Skip if empty rect
+                if r.is_empty:
+                    continue
+                # Skip if it is a full page border or very thin line spanning most of page width/height
+                if (r.width > page.rect.width * 0.9 and r.height < 10) or (r.height > page.rect.height * 0.9 and r.width < 10):
+                    continue
+                # Skip if it spans the whole page size (like background or page border rect)
+                if r.width > page.rect.width * 0.95 and r.height > page.rect.height * 0.95:
+                    continue
+                # Skip if in header region (top 80 pt)
+                if r.y1 < 80:
+                    continue
+                # Skip if in footer region (bottom 80 pt from the end)
+                if r.y0 > page.rect.height - 80:
+                    continue
+                content_paths.append(p)
                 
-                # Calculate image hash for caching
-                with open(page_img_path, "rb") as f_img:
-                    page_img_hash = hashlib.sha256(f_img.read()).hexdigest()
+            if len(content_paths) > 10:
+                # Calculate bounding box of all content paths
+                bbox = fitz.Rect(content_paths[0]["rect"])
+                for p in content_paths[1:]:
+                    bbox.include_rect(p["rect"])
                 
-                # Step 2 — SQLite cache check:
-                cached_desc = get_cached_description(page_img_hash)
-                if cached_desc:
-                    page_chunk = Document(
-                        page_content=cached_desc,
-                        metadata={
-                            "thread_id": thread_id,
-                            "filename": filename,
-                            "page": page_num,
-                            "chunk_type": "image",
-                            "image_path": page_img_path,
-                            "image_hash": page_img_hash,
-                            "needs_vlm": False,
-                            "vlm_done": True
-                        }
-                    )
-                    all_chunks.append(page_chunk)
-                else:
-                    # Step 3 — CASE B: No surrounding text found for vector drawings page snapshot
-                    smolvlm_success = False
-                    smolvlm_output = ""
-                    if smolvlm is not None:
+                # Check if we have a valid, non-empty bounding box
+                if not bbox.is_empty and bbox.width > 20 and bbox.height > 20:
+                    # Pad it slightly to ensure we capture the whole drawing nicely (e.g. 15 pt)
+                    padding = 15
+                    bbox.x0 = max(0, bbox.x0 - padding)
+                    bbox.y0 = max(0, bbox.y0 - padding)
+                    bbox.x1 = min(page.rect.width, bbox.x1 + padding)
+                    bbox.y1 = min(page.rect.height, bbox.y1 + padding)
+                    
+                    # Render only this section of the page as a snapshot
+                    pix = page.get_pixmap(clip=bbox, dpi=150)
+                    page_img_filename = f"page_{page_num}_snapshot.png"
+                    page_img_path = os.path.join(images_dir, page_img_filename)
+                    pix.save(page_img_path)
+                    
+                    # Calculate image hash for caching
+                    with open(page_img_path, "rb") as f_img:
+                        page_img_hash = hashlib.sha256(f_img.read()).hexdigest()
+                    
+                    # Step 2 — SQLite cache check:
+                    cached_desc = get_cached_description(page_img_hash)
+                    if cached_desc:
+                        page_chunk = Document(
+                            page_content=cached_desc,
+                            metadata={
+                                "thread_id": thread_id,
+                                "filename": filename,
+                                "page": page_num,
+                                "chunk_type": "image",
+                                "image_path": page_img_path,
+                                "image_hash": page_img_hash,
+                                "needs_vlm": False,
+                                "vlm_done": True
+                            }
+                        )
+                        all_chunks.append(page_chunk)
+                    else:
+                        # Step 3 — CASE A/B branching:
+                        # Bounding box & surrounding context for vector drawings
+                        extended_rect = fitz.Rect(max(0, bbox.x0 - 50), max(0, bbox.y0 - 150), min(page.rect.width, bbox.x1 + 50), min(bbox.y1 + 150, page.rect.height))
+                        
+                        # Extract surrounding text from text blocks on the page
+                        blocks = page.get_text("blocks")
+                        surrounding_blocks = []
+                        for b in blocks:
+                            if b[6] == 0:  # Text block
+                                block_rect = fitz.Rect(b[:4])
+                                # Exclude text in tables
+                                if any(block_rect.intersects(tr) for tr in table_rects):
+                                    continue
+                                if block_rect.intersects(extended_rect):
+                                    surrounding_blocks.append(b[4])
+                        
+                        surrounding_text = "\n".join(surrounding_blocks).strip()
+                        has_surrounding = bool(surrounding_text.strip())
+                        
+                        smolvlm_success = False
+                        smolvlm_output = ""
                         try:
-                            smolvlm_output = call_smolvlm(smolvlm, page_img_path)
-                            smolvlm_success = True
+                            smolvlm_output = process_image_content(page_img_path)
+                            if smolvlm_output:
+                                smolvlm_success = True
                         except Exception as e:
-                            print(f"[Ingestion] Warning: SmolVLM execution failed on snapshot {page_img_path}: {e}")
-                            traceback.print_exc()
-                    else:
-                        print(f"[Ingestion] Warning: SmolVLM model not available. Skipping SmolVLM execution on snapshot {page_img_path}.")
-                    
-                    if smolvlm_success:
-                        chunk_text = smolvlm_output
-                    else:
-                        chunk_text = ""
-                    
-                    page_chunk = Document(
-                        page_content=chunk_text,
-                        metadata={
-                            "thread_id": thread_id,
-                            "filename": filename,
-                            "page": page_num,
-                            "chunk_type": "image",
-                            "image_path": page_img_path,
-                            "image_hash": page_img_hash,
-                            "needs_vlm": True,
-                            "vlm_done": False
-                        }
-                    )
-                    all_chunks.append(page_chunk)
-                print(f"[Ingestion] Detected vector graphics (non-table paths={len(non_table_paths)}) on page {page_num + 1}. Saved page snapshot.")
+                            logger.warning(f"[Ingestion] Visual processing failed on snapshot {page_img_path}: {e}")
+                        
+                        if has_surrounding:
+                            # CASE A
+                            if smolvlm_success:
+                                chunk_text = f"{surrounding_text}\n[Visual hint: {smolvlm_output}]"
+                            else:
+                                chunk_text = surrounding_text
+                        else:
+                            # CASE B
+                            if smolvlm_success:
+                                chunk_text = smolvlm_output
+                            else:
+                                chunk_text = ""
+                        
+                        if smolvlm_success and page_img_hash:
+                            save_to_cache(page_img_hash, smolvlm_output)
+                            
+                        page_chunk = Document(
+                            page_content=chunk_text,
+                            metadata={
+                                "thread_id": thread_id,
+                                "filename": filename,
+                                "page": page_num,
+                                "chunk_type": "image",
+                                "image_path": page_img_path,
+                                "image_hash": page_img_hash,
+                                "needs_vlm": not smolvlm_success,
+                                "vlm_done": smolvlm_success
+                            }
+                        )
+                        all_chunks.append(page_chunk)
+                    logger.info(f"[Ingestion] Page {page_num + 1}: vector drawing snapshot saved ({bbox.width:.0f}x{bbox.height:.0f}px) at {page_img_path}.")
         except Exception as snap_err:
-            print(f"[Ingestion] Error creating page snapshot on page {page_num}: {snap_err}")
+            logger.error(f"[Ingestion] Snapshot failed on page {page_num}: {snap_err}", exc_info=True)
             
         # 3. Extract text excluding table areas
         blocks = page.get_text("blocks")
@@ -879,6 +910,13 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
     vectorstore = get_vectorstore()
     if all_chunks:
         vectorstore.add_documents(all_chunks)
+
+        # Debug hook (disabled in production)
+        # try:
+        #     from inspect_chunks import save_chunks_to_disk
+        #     save_chunks_to_disk(all_chunks, filename)
+        # except Exception as debug_err:
+        #     print(f"[Debug Chunks] Failed to auto-save chunks to disk: {debug_err}")
 
     # Invalidate the BM25 cache since new documents are added
     invalidate_bm25_cache(thread_id)
@@ -924,7 +962,7 @@ def convert_docx_to_pdf(docx_path: str) -> str:
     return pdf_path
 
 
-def index_docx_file(temp_path: str, filename: str, thread_id: str, db_uri: str = None, smolvlm = None) -> int:
+def index_docx_file(temp_path: str, filename: str, thread_id: str, db_uri: str = None) -> int:
     """Converts DOCX to PDF first, then indexes the PDF, registering as docx."""
     pdf_path = None
     try:
@@ -932,7 +970,7 @@ def index_docx_file(temp_path: str, filename: str, thread_id: str, db_uri: str =
         pdf_path = convert_docx_to_pdf(temp_path)
         
         # 2. Call the existing index_pdf_file() with that PDF path, using db_uri=None so it doesn't write 'pdf' to db
-        chunks_added = index_pdf_file(pdf_path, filename, thread_id, db_uri=None, smolvlm=smolvlm)
+        chunks_added = index_pdf_file(pdf_path, filename, thread_id, db_uri=None)
         
         # 3. Register file_type = 'docx' in the thread_files table
         if db_uri:

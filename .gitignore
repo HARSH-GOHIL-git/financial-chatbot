@@ -12,6 +12,8 @@ __pycache__/
 # Databases & local state
 chroma_db/
 image_cache.db
+chatbot.db
+*.db
 
 # OS/System files
 .DS_Store

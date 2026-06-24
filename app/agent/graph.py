@@ -222,22 +222,19 @@ New messages to summarize:
         # Retrieve files uploaded/indexed in the current thread to inject into the system prompt
         thread_files = []
         if tid:
-            from app.core.config import DB_URI
             from app.services.rag_pipeline import get_vectorstore
-            import psycopg
+            from app.core.db import get_db_connection
             
-            if DB_URI:
-                try:
-                    db_uri_clean = DB_URI.strip('"').strip("'")
-                    with psycopg.connect(db_uri_clean) as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                "SELECT filename FROM thread_files WHERE thread_id = %s",
-                                (tid,)
-                            )
-                            thread_files = [row[0] for row in cur.fetchall()]
-                except Exception as db_err:
-                    logger.error(f"[chat_node] DB query for thread files failed: {db_err}", exc_info=True)
+            try:
+                with get_db_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT filename FROM thread_files WHERE thread_id = %s",
+                            (tid,)
+                        )
+                        thread_files = [row[0] for row in cur.fetchall()]
+            except Exception as db_err:
+                logger.error(f"[chat_node] DB query for thread files failed: {db_err}", exc_info=True)
                     
             if not thread_files:
                 try:

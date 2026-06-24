@@ -12,13 +12,13 @@ from pydantic import BaseModel, Field
 import psycopg
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.postgres import PostgresSaver
 from datetime import datetime, timezone
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # Modular imports
 from app.core.config import DB_URI, MCP_SERVERS, MCP_FS_ROOT
 from app.core.logger import setup_logging, get_logger
+from app.core.db import get_db_connection, get_checkpointer
 
 logger = get_logger(__name__)
 from app.core.security import sanitize_value
@@ -70,7 +70,6 @@ chatbot = None
 _checkpointer = None
 _mcp_client = None
 _loaded_tool_names: list[str] = []
-_mcp_session_contexts = []
 _main_loop = None
 _supported_languages = []
 _languages_lock = asyncio.Lock()
@@ -114,19 +113,15 @@ async def lifespan(_app: FastAPI):
         playwright_playwright_navigate,
     ]
 
-    # MCP tools
-    from langchain_mcp_adapters.tools import load_mcp_tools
-
+    # MCP tools — use get_tools() which creates ephemeral sessions per tool call
+    # This avoids cancel scope / async generator lifecycle errors
     mcp_tools = []
-    for name, config in MCP_SERVERS.items():
+
+    for name, srv_config in MCP_SERVERS.items():
         try:
-            client = MultiServerMCPClient({name: config}, tool_name_prefix=True)
-            session_ctx = client.session(name)
-            session = await session_ctx.__aenter__()
-            _mcp_session_contexts.append(session_ctx)
-            
-            tools = await load_mcp_tools(session, server_name=name, tool_name_prefix=True)
-            
+            client = MultiServerMCPClient({name: srv_config}, tool_name_prefix=True)
+            tools = await client.get_tools()
+
             # Restrict filesystem tools to read-only
             if name == "filesystem":
                 dangerous_tools = {
@@ -140,7 +135,7 @@ async def lifespan(_app: FastAPI):
 
             for t in tools:
                 t._run = make_sync_run(t, get_main_loop)
-            
+
             # Verify browser functionality if playwright
             if name == "playwright":
                 try:
@@ -155,8 +150,6 @@ async def lifespan(_app: FastAPI):
                         logger.warning("[MCP] Playwright: no navigate tool found.")
                 except Exception as p_err:
                     logger.error(f"[MCP] Playwright check FAILED: {p_err} — skipping.", exc_info=True)
-                    await session_ctx.__aexit__(None, None, None)
-                    _mcp_session_contexts.remove(session_ctx)
                     continue
 
             mcp_tools.extend(tools)
@@ -178,14 +171,14 @@ async def lifespan(_app: FastAPI):
     logger.info(f"[App] Tools available ({len(_loaded_tool_names)}): {_loaded_tool_names}")
 
     logger.info(f"[App] Connecting to DB...")
-    checkpointer_cm = PostgresSaver.from_conn_string(DB_URI)
+    checkpointer_class, checkpointer_cm = get_checkpointer()
     _checkpointer = checkpointer_cm.__enter__()
-    _checkpointer.setup()
+    if hasattr(_checkpointer, "setup"):
+        _checkpointer.setup()
 
     # Initialize thread metadata and files tables
     try:
-        db_uri_clean = DB_URI.strip('"').strip("'")
-        with psycopg.connect(db_uri_clean) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS thread_metadata (
@@ -218,12 +211,6 @@ async def lifespan(_app: FastAPI):
     logger.info("[App] Ready.")
 
     yield
-
-    for session_ctx in _mcp_session_contexts:
-        try:
-            await session_ctx.__aexit__(None, None, None)
-        except BaseException as e:
-            logger.info(f"[App] MCP session closed: {type(e).__name__}")
 
     try:
         checkpointer_cm.__exit__(None, None, None)
@@ -318,11 +305,8 @@ async def get_languages():
 
 
 def generate_and_save_title(thread_id: str, message_text: str):
-    if not DB_URI:
-        return
     try:
-        db_uri_clean = DB_URI.strip('"').strip("'")
-        with psycopg.connect(db_uri_clean) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT thread_name FROM thread_metadata WHERE thread_id = %s", (thread_id,))
                 row = cur.fetchone()
@@ -358,7 +342,7 @@ def generate_and_save_title(thread_id: str, message_text: str):
         if not title:
             title = f"Chat {thread_id[:8]}"
             
-        with psycopg.connect(db_uri_clean) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -395,11 +379,8 @@ class RenameRequest(BaseModel):
 
 @app.post("/threads/{thread_id}/rename")
 async def rename_thread(thread_id: str, request: RenameRequest):
-    if not DB_URI:
-        raise HTTPException(status_code=500, detail="Database URI not configured")
     try:
-        db_uri_clean = DB_URI.strip('"').strip("'")
-        with psycopg.connect(db_uri_clean) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -419,11 +400,8 @@ async def rename_thread(thread_id: str, request: RenameRequest):
 
 @app.delete("/threads/{thread_id}")
 async def delete_thread(thread_id: str):
-    if not DB_URI:
-        raise HTTPException(status_code=500, detail="Database URI not configured")
     try:
-        db_uri_clean = DB_URI.strip('"').strip("'")
-        with psycopg.connect(db_uri_clean) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
                 cur.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (thread_id,))
@@ -441,9 +419,8 @@ async def delete_thread(thread_id: str):
 async def get_thread_documents(thread_id: str):
     try:
         seen_filenames = set()
-        if DB_URI:
-            db_uri_clean = DB_URI.strip('"').strip("'")
-            with psycopg.connect(db_uri_clean) as conn:
+        try:
+            with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT filename FROM thread_files WHERE thread_id = %s",
@@ -452,6 +429,8 @@ async def get_thread_documents(thread_id: str):
                     rows = cur.fetchall()
                     for (fname,) in rows:
                         seen_filenames.add(fname)
+        except Exception as db_err:
+            logger.error(f"[App] DB query for thread documents failed: {db_err}", exc_info=True)
 
         # Get count of chunks for each filename in Chroma
         vectorstore = get_vectorstore()
@@ -505,14 +484,14 @@ async def list_threads():
         pass
 
     thread_names = {}
-    if DB_URI and thread_ids:
+    if thread_ids:
         try:
-            db_uri_clean = DB_URI.strip('"').strip("'")
-            with psycopg.connect(db_uri_clean) as conn:
+            placeholders = ",".join(["%s"] * len(thread_ids))
+            with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT thread_id, thread_name FROM thread_metadata WHERE thread_id = ANY(%s)",
-                        (thread_ids,)
+                        f"SELECT thread_id, thread_name FROM thread_metadata WHERE thread_id IN ({placeholders})",
+                        tuple(thread_ids)
                     )
                     rows = cur.fetchall()
                     for tid_db, name_db in rows:
@@ -529,11 +508,8 @@ async def list_threads():
 
 
 def save_message_timestamps(thread_id: str, messages: list):
-    if not DB_URI:
-        return
     try:
-        db_uri_clean = DB_URI.strip('"').strip("'")
-        with psycopg.connect(db_uri_clean) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 for msg in messages:
                     msg_id = getattr(msg, "id", None)
@@ -567,11 +543,8 @@ def save_message_timestamps(thread_id: str, messages: list):
 
 
 def get_message_timestamps(thread_id: str) -> dict[str, str]:
-    if not DB_URI:
-        return {}
     try:
-        db_uri_clean = DB_URI.strip('"').strip("'")
-        with psycopg.connect(db_uri_clean) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT message_id, timestamp FROM message_timestamps WHERE thread_id = %s",
@@ -948,9 +921,8 @@ async def upload_excel(file: UploadFile = File(...), thread_id: str = "default")
         with open(target_path, "wb") as buffer:
             buffer.write(file_bytes)
 
-        if DB_URI:
-            db_uri_clean = DB_URI.strip('"').strip("'")
-            with psycopg.connect(db_uri_clean) as conn:
+        try:
+            with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
                         INSERT INTO thread_files (thread_id, filename, file_type)
@@ -958,6 +930,8 @@ async def upload_excel(file: UploadFile = File(...), thread_id: str = "default")
                         ON CONFLICT (thread_id, filename) DO NOTHING;
                     """, (thread_id, filename, 'excel'))
                     conn.commit()
+        except Exception as db_err:
+            logger.error(f"[App] DB save for Excel file failed: {db_err}", exc_info=True)
 
         return {
             "status": "success",
@@ -1007,15 +981,16 @@ async def delete_file(filename: str, thread_id: str):
     try:
         # Check if the filename exists in thread_files for that thread
         exists = False
-        if DB_URI:
-            db_uri_clean = DB_URI.strip('"').strip("'")
-            with psycopg.connect(db_uri_clean) as conn:
+        try:
+            with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT 1 FROM thread_files WHERE thread_id = %s AND filename = %s",
                         (thread_id, filename)
                     )
                     exists = cur.fetchone() is not None
+        except Exception as db_err:
+            logger.error(f"[App] DB query for file check failed: {db_err}", exc_info=True)
         
         if not exists:
             raise HTTPException(status_code=404, detail=f"File '{filename}' not found for thread '{thread_id}'")
@@ -1040,15 +1015,17 @@ async def delete_file(filename: str, thread_id: str):
         if os.path.exists(workspace_file_path):
             os.remove(workspace_file_path)
 
-        # 3. Delete from Postgres thread_files table
-        if DB_URI:
-            with psycopg.connect(db_uri_clean) as conn:
+        # 3. Delete from thread_files table
+        try:
+            with get_db_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "DELETE FROM thread_files WHERE thread_id = %s AND filename = %s",
                         (thread_id, filename)
                     )
                     conn.commit()
+        except Exception as db_err:
+            logger.error(f"[App] DB delete for file failed: {db_err}", exc_info=True)
 
         # 4. Invalidate BM25 cache
         invalidate_bm25_cache(thread_id)

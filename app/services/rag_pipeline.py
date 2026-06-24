@@ -12,7 +12,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-import psycopg
+from app.core.db import get_db_connection
 
 from app.core.logger import get_logger
 logger = get_logger(__name__)
@@ -282,24 +282,21 @@ def search_knowledge_base(
     If the user references a specific file, pass it via the 'filename' parameter.
     """
     try:
-        from app.core.config import DB_URI
         thread_id = config.get("configurable", {}).get("thread_id", "default") if config else "default"
         vectorstore = get_vectorstore()
         
         # 1. Fetch files associated with this thread to match/resolve the filename
         thread_files = []
-        if DB_URI:
-            try:
-                db_uri_clean = DB_URI.strip('"').strip("'")
-                with psycopg.connect(db_uri_clean) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT filename FROM thread_files WHERE thread_id = %s",
-                            (thread_id,)
-                        )
-                        thread_files = [row[0] for row in cur.fetchall()]
-            except Exception as db_err:
-                logger.error(f"[RAG] DB query for thread files failed: {db_err}", exc_info=True)
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT filename FROM thread_files WHERE thread_id = %s",
+                        (thread_id,)
+                    )
+                    thread_files = [row[0] for row in cur.fetchall()]
+        except Exception as db_err:
+            logger.error(f"[RAG] DB query for thread files failed: {db_err}", exc_info=True)
                 
         # If DB query failed or empty, fallback to querying Chroma unique filenames
         if not thread_files:
@@ -923,15 +920,17 @@ def index_pdf_file(temp_path: str, filename: str, thread_id: str, db_uri: str = 
 
     # Register in thread_files table
     if db_uri:
-        db_uri_clean = db_uri.strip('"').strip("'")
-        with psycopg.connect(db_uri_clean) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO thread_files (thread_id, filename, file_type)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (thread_id, filename) DO NOTHING;
-                """, (thread_id, filename, 'pdf'))
-                conn.commit()
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO thread_files (thread_id, filename, file_type)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (thread_id, filename) DO NOTHING;
+                    """, (thread_id, filename, 'pdf'))
+                    conn.commit()
+        except Exception as db_err:
+            logger.error(f"[RAG] DB register for PDF failed: {db_err}", exc_info=True)
     return len(all_chunks)
 
 
@@ -974,15 +973,17 @@ def index_docx_file(temp_path: str, filename: str, thread_id: str, db_uri: str =
         
         # 3. Register file_type = 'docx' in the thread_files table
         if db_uri:
-            db_uri_clean = db_uri.strip('"').strip("'")
-            with psycopg.connect(db_uri_clean) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO thread_files (thread_id, filename, file_type)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (thread_id, filename) DO NOTHING;
-                    """, (thread_id, filename, 'docx'))
-                    conn.commit()
+            try:
+                with get_db_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO thread_files (thread_id, filename, file_type)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (thread_id, filename) DO NOTHING;
+                        """, (thread_id, filename, 'docx'))
+                        conn.commit()
+            except Exception as db_err:
+                logger.error(f"[RAG] DB register for docx failed: {db_err}", exc_info=True)
                     
         return chunks_added
     finally:

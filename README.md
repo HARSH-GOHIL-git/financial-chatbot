@@ -10,7 +10,7 @@ An advanced, production-grade agentic chatbot built with **LangGraph**, **FastAP
 * **Conditional State Machine**: Dynamic routing between standard conversation, knowledge-base querying, python sandbox execution, and web navigation.
 * **Stop Generation**: Immediate client-side streaming cancellation via `asyncio` task registers.
 * **Long-Term Memory**: Automatic context summarization of older dialogue steps to prevent token bloat while maintaining state history.
-* **Thread Persistence**: Powered by a robust `PostgresSaver` checkpointer ensuring user conversations survive server restarts.
+* **Thread Persistence (Plug-and-Play)**: Powered by a unified database manager supporting automatic PostgreSQL database creation, or zero-configuration SQLite fallback. User conversations survive server restarts out-of-the-box.
 * **Thread Isolation**: Automatic validation of conversation thread IDs against the local database to ensure session isolation, preventing cross-talk between user threads.
 
 ### 🔍 Advanced Hybrid RAG Pipeline
@@ -51,7 +51,7 @@ An advanced, production-grade agentic chatbot built with **LangGraph**, **FastAP
 ```mermaid
 graph TD
     UI[Frontend: Glassmorphic Web UI] <-->|Server-Sent Events / JSON| API[FastAPI Backend]
-    API <-->|Thread Checkpoint State| Postgres[(PostgreSQL DB)]
+    API <-->|Thread Checkpoint State| DB[(PostgreSQL or SQLite DB)]
     API -->|Prompt & State| Graph{LangGraph State Machine}
     
     Graph -->|Route| ChatNode[chat_node: Router & LLM]
@@ -75,7 +75,7 @@ graph TD
 ### 📋 Prerequisites Checklist
 Ensure you have the following software installed on your system before proceeding:
 1. **Miniconda / Anaconda** (Python 3.10+)
-2. **PostgreSQL** (v14+; used for LangGraph session checkpointers and thread files metadata)
+2. **PostgreSQL (v14+)** *(Optional)*: Used for enterprise-grade session persistence. If not configured or not installed, the application seamlessly falls back to a zero-configuration local **SQLite** database (`chatbot.db`).
 3. **Node.js & NPM** (v18+; required for executing Model Context Protocol filesystem and Playwright browser servers)
 4. **LibreOffice** (required in headless mode to convert uploaded Word `.docx` documents to PDF)
 5. **FFmpeg** (required by the audio transcription service `faster-whisper` to parse voice uploads)
@@ -88,25 +88,22 @@ Ensure you have the following software installed on your system before proceedin
 #### Step 1: Clone the Repository & Navigate to Workspace
 ```bash
 git clone https://github.com/HARSH-GOHIL-git/financial-chatbot.git
-cd financial-chatbot/chatbot-17
+cd financial-chatbot/
 ```
 
 #### Step 2: Set Up the Conda Environment
-Use the provided `llm.yml` or `conda-requirements.txt` to restore the environment:
+To avoid package conflicts, create a clean environment and install all dependencies directly from `requirements.txt` via pip:
 
-##### Option A: Using Conda Environment File (Recommended)
 ```bash
-conda env create -f llm.yml
-conda activate llm
-```
-
-##### Option B: Manual Installation (Fallback for other Platforms/OS)
-If the exact build versions in the requirements file fail to resolve on your platform, create a clean environment and install manually:
-```bash
+# Create a clean Conda environment with Python 3.10
 conda create --name llm python=3.10 -y
 conda activate llm
-pip install fastapi uvicorn psycopg rank-bm25 sentence-transformers llama-cpp-python faster-whisper Pillow google-genai langchain-core langchain-google-genai langgraph langchain-community langchain-text-splitters python-dotenv huggingface_hub starlette starlette-sse openpyxl pandas requests ddgs playwright langchain-mcp-adapters rapidocr-onnxruntime
+
+# Install all package dependencies directly
+pip install -r requirements.txt
 ```
+
+*(Note: The full PyPI dependencies have been consolidated into `requirements.txt` for a smooth, single-step environment setup.)*
 
 #### Step 3: Install System Dependencies
 Install system libraries for document conversion (`libreoffice`) and voice processing (`ffmpeg`):
@@ -126,29 +123,24 @@ To enable web crawling tools, set up Playwright within the active environment:
 playwright install --with-deps
 ```
 
-#### Step 5: Setup the PostgreSQL Database
-1. Connect to your local PostgreSQL instance:
-   ```bash
-   sudo -u postgres psql
-   ```
-2. Create the target database, user, and permissions:
-   ```sql
-   CREATE DATABASE chatbot_db;
-   CREATE USER harsh WITH PASSWORD 'harsh';
-   GRANT ALL PRIVILEGES ON DATABASE chatbot_db TO harsh;
-   ```
+#### Step 5: Database Setup (Fully Automated)
+The database layer is designed to be **plug-and-play**:
+* **Option A: SQLite Fallback (Recommended/Zero-Config)**
+  You don't need to do anything! If you don't have PostgreSQL installed or if you leave the database URI unconfigured, the application will automatically create and initialize a local SQLite database (`chatbot.db`) in the project root on startup.
+* **Option B: PostgreSQL (Automated Provisioning)**
+  If you prefer to use PostgreSQL, make sure your PostgreSQL server is running and configure the `DB_URI` connection string in your `.env` file. On startup, the application will automatically check for the existence of the target database (`chatbot_db`) and create it for you, followed by automatic schema initialization.
 
 #### Step 6: Configure Environment Variables
-Create a `.env` file in the root folder of the project (`chatbot-17/`) containing the following variables:
+Create a `.env` file in the root folder of the project (`financial-chatbot/`) containing the following variables:
 ```env
 # Google Gemini API Credentials (Required)
 GOOGLE_API_KEY="AIzaSyYourRealGeminiKeyHere"
 
-# PostgreSQL connection URI (Required)
-DB_URI="postgresql://harsh:harsh@localhost:5432/chatbot_db"
+# PostgreSQL connection URI (Optional - omit or comment out to use SQLite chatbot.db fallback)
+# DB_URI="postgresql://harsh:harsh@localhost:5432/chatbot_db"
 
 # Sandboxed root directory for agent tool outputs
-MCP_FS_ROOT="/home/neuramonks/Desktop/Harsh/LLM/LangGraph/langgraph-practice/chatbot-17"
+MCP_FS_ROOT="/home/neuramonks/Desktop/Harsh/LLM/LangGraph/langgraph-practice/chatbot-from-github/Fintech-chatbot/financial-chatbot"
 
 # AlphaVantage API Token for live stock prices (Optional)
 ALPHA_VANTAGE_KEY="your_alphavantage_api_key_here"
@@ -162,7 +154,7 @@ LANGSMITH_PROJECT=""
 #### Step 7: Launch the Chatbot Backend
 Start the FastAPI server via Uvicorn from the project root:
 ```bash
-python -m uvicorn backend:app --reload --host 0.0.0.0 --port 8000
+uvicorn backend:app --reload --host 0.0.0.0 --port 8000
 ```
 
 #### Step 8: Validate the Setup
@@ -181,6 +173,7 @@ python -m uvicorn backend:app --reload --host 0.0.0.0 --port 8000
 │   │   └── tools.py          # Tool registry (Web, Python, Playwright, Stocks)
 │   ├── core/
 │   │   ├── config.py         # App configurations & secrets
+│   │   ├── db.py             # Unified Database Manager & Checkpointer Layer
 │   │   ├── logger.py         # Centralized rotating file logger configuration
 │   │   └── security.py       # Input validation & security tools
 │   ├── services/
@@ -190,13 +183,13 @@ python -m uvicorn backend:app --reload --host 0.0.0.0 --port 8000
 ├── static/
 │   ├── app.js                # Frontend reactive interface logic
 │   ├── index.html            # Main dashboard layout
-│   └── styles.css            # Glassmorphic dark styling system
+│   └── style.css             # Glassmorphic dark styling system
 ├── logs/                     # Ignored logs folder (holds app.log)
 ├── chroma_db/                # Local Chroma vector database
+├── chatbot.db                # Local SQLite database (auto-created fallback)
 ├── image_cache.db            # SQLite cache of VLM descriptions
 ├── DOCUMENTATION.md          # Full Technical Reference Manual
-├── conda-requirements.txt   # Conda packages list (Recommended setup)
-├── llm.yml                   # Conda environment configuration
+├── requirements.txt         # PyPI package dependencies (Consolidated PyPI setup)
 └── README.md                 # Project documentation
 ```
 
